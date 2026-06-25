@@ -72,19 +72,7 @@ def test_dashboard_slot_reports_up_when_enabled(
         cmd="sleep 120",
     )
     # uvicorn takes a moment to bind; poll svstat.
-    deadline = time.monotonic() + 30.0
-    last = ""
-    while time.monotonic() < deadline:
-        r = docker_exec(
-            container_name, "/command/s6-svstat", "/run/service/dashboard",
-        )
-        last = r.stdout
-        if r.returncode == 0 and "up " in r.stdout:
-            return  # success
-        time.sleep(0.5)
-    raise AssertionError(
-        f"Dashboard slot never reached up state; last svstat: {last!r}"
-    )
+    poll_container(container_name, "/command/s6-svstat /run/service/dashboard | grep -q 'up '")
 
 
 def test_dashboard_opt_in_starts(

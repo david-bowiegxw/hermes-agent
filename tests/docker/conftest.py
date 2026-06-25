@@ -275,8 +275,7 @@ def wait_for_log(
 ) -> str:
     """Poll until a log file inside the container contains ``needle``.
 
-    Returns the matching log content on success, or the last observed
-    contents on timeout (so the caller can render a meaningful diagnostic).
+    Returns the full log on success.
     """
     end = time.monotonic() + deadline_s
     last = ""
@@ -289,7 +288,7 @@ def wait_for_log(
             if needle in last:
                 return last
         time.sleep(interval_s)
-    return last
+    raise AssertionError(f"Didn't see `{needle}` in {log_path} within {deadline_s} in container {container}")
 
 
 
@@ -298,8 +297,7 @@ def wait_for_docker_logs(
 ) -> str:
     """Poll ``docker logs`` until ``needle`` appears or deadline expires.
 
-    Returns the full docker logs on success, or the last-observed
-    logs on timeout (so the caller's assertion message is useful).
+    Returns the full docker logs on success.
     """
     end = time.monotonic() + deadline_s
     last = ""
@@ -312,4 +310,4 @@ def wait_for_docker_logs(
         if needle in last:
             return last
         time.sleep(interval_s)
-    return last
+    raise AssertionError(f"Didn't see `{needle}` in docker logs within {deadline_s} in container {container}")
