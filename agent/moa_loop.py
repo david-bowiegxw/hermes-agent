@@ -9,6 +9,7 @@ iteration.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from agent.auxiliary_client import call_llm
@@ -16,9 +17,93 @@ from agent.transports import get_transport
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on concurrent reference-model calls. References are independent
+# advisory calls (no tools, no inter-dependence), so we fan them out the same
+# way delegate_task runs a batch: all in flight at once, results collected when
+# every reference finishes. Presets rarely list more than a handful of
+# references; this cap just protects against a pathologically large preset
+# opening dozens of sockets at once.
+_MAX_REFERENCE_WORKERS = 8
+
 
 def _slot_label(slot: dict[str, str]) -> str:
     return f"{slot.get('provider', '').strip()}:{slot.get('model', '').strip()}"
+
+
+def _run_reference(
+    slot: dict[str, str],
+    ref_messages: list[dict[str, Any]],
+    *,
+    temperature: float,
+    max_tokens: int,
+) -> tuple[str, str]:
+    """Call one reference model and return ``(label, text)``.
+
+    Never raises: a failed reference becomes a labelled note so the aggregator
+    can still act with partial context. Designed to run inside a thread pool —
+    ``call_llm`` is synchronous/blocking, so threads (not asyncio) are the right
+    concurrency primitive, mirroring ``delegate_task``'s batch fan-out.
+    """
+    label = _slot_label(slot)
+    try:
+        response = call_llm(
+            task="moa_reference",
+            provider=slot["provider"],
+            model=slot["model"],
+            messages=ref_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return label, _extract_text(response) or "(empty response)"
+    except Exception as exc:
+        logger.warning("MoA reference model %s failed: %s", label, exc)
+        return label, f"[failed: {exc}]"
+
+
+def _run_references_parallel(
+    reference_models: list[dict[str, str]],
+    ref_messages: list[dict[str, Any]],
+    *,
+    temperature: float,
+    max_tokens: int,
+) -> list[tuple[str, str]]:
+    """Fan out all reference models in parallel, returning outputs in order.
+
+    Like ``delegate_task``'s batch mode, every reference is dispatched at once
+    and we block until all of them finish before handing the joined results to
+    the aggregator. Output order matches ``reference_models`` so the
+    ``Reference {idx}`` labelling stays stable. MoA presets that reference
+    another MoA preset are skipped here (recursion guard) with a labelled note.
+    """
+    if not reference_models:
+        return []
+
+    results: list[tuple[str, str] | None] = [None] * len(reference_models)
+    futures = {}
+    workers = min(_MAX_REFERENCE_WORKERS, len(reference_models))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for idx, slot in enumerate(reference_models):
+            if slot.get("provider") == "moa":
+                results[idx] = (
+                    _slot_label(slot),
+                    "[skipped: MoA presets cannot recursively reference MoA]",
+                )
+                continue
+            futures[
+                executor.submit(
+                    _run_reference,
+                    slot,
+                    ref_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            ] = idx
+        # Collect every reference before returning — the aggregator needs the
+        # complete set, so there is no early-exit / first-completed path here.
+        for future, idx in futures.items():
+            results[idx] = future.result()
+
+    return [r for r in results if r is not None]
 
 
 def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -93,22 +178,12 @@ def aggregate_moa_context(
     """
     reference_outputs: list[tuple[str, str]] = []
     ref_messages = _reference_messages(api_messages)
-    for slot in reference_models:
-        label = _slot_label(slot)
-        try:
-            response = call_llm(
-                task="moa_reference",
-                provider=slot["provider"],
-                model=slot["model"],
-                messages=ref_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            text = _extract_text(response)
-            reference_outputs.append((label, text or "(empty response)"))
-        except Exception as exc:
-            logger.warning("MoA reference model %s failed: %s", label, exc)
-            reference_outputs.append((label, f"[failed: {exc}]"))
+    reference_outputs = _run_references_parallel(
+        reference_models,
+        ref_messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
     joined = "\n\n".join(
         f"Reference {idx} — {label}:\n{text}"
@@ -178,23 +253,12 @@ class MoAChatCompletions:
 
         reference_outputs: list[tuple[str, str]] = []
         ref_messages = _reference_messages(messages)
-        for slot in reference_models:
-            if slot.get("provider") == "moa":
-                reference_outputs.append((_slot_label(slot), "[skipped: MoA presets cannot recursively reference MoA]"))
-                continue
-            try:
-                response = call_llm(
-                    task="moa_reference",
-                    provider=slot["provider"],
-                    model=slot["model"],
-                    messages=ref_messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                reference_outputs.append((_slot_label(slot), _extract_text(response) or "(empty response)"))
-            except Exception as exc:
-                logger.warning("MoA reference model %s failed: %s", _slot_label(slot), exc)
-                reference_outputs.append((_slot_label(slot), f"[failed: {exc}]"))
+        reference_outputs = _run_references_parallel(
+            reference_models,
+            ref_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
         agg_messages = [dict(m) for m in messages]
         if reference_outputs:
