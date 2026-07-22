@@ -17,6 +17,13 @@ IMPORTANT — model list maintenance:
   be updated when Ark adds/removes models.
 
   Last updated: 2026-06-26 (11 models)
+
+  Re-verified 2026-07-22: sent a live request to /api/coding for each of
+  the 11 hardcoded IDs; all still respond 200. Volcengine's 2026-07-22
+  account notice retires the legacy bare "Doubao-Seed-Code" model ID on
+  2026-08-05 in favor of the Seed 2.0 lineup — this list already used
+  the Seed 2.0 names (doubao-seed-2.0-pro/lite/mini/code) from day one,
+  so the migration requires no change here.
 """
 
 import logging
